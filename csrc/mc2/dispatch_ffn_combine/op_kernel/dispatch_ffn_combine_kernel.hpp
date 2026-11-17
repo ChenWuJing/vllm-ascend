@@ -70,6 +70,9 @@ template <
 >
 class DispatchFFNCombineKernel {
 public:
+    // Dispatch signals the matmul once per batch of expert groups instead of
+    // once per group: one full-core barrier per batch instead of per group.
+    static constexpr int32_t GROUP_SYNC_SIZE = 4;
     using BlockMmad = BlockMmad_;
     using ArchTag = typename BlockMmad::ArchTag;
     using L1TileShape = typename BlockMmad::L1TileShape;
@@ -478,12 +481,15 @@ private:
             uint32_t startLoopIdx = ((coreIdx < startCoreIdx) ? (coreIdx + coreNum) : coreIdx) - startCoreIdx;
             // Loop through the matmul of each groupIdx
 
-            for (uint32_t loopIdx = startLoopIdx; loopIdx < coreLoops; loopIdx += coreNum) {
-                for(;syncGroupIdx <= groupIdx; syncGroupIdx++) {
-                    AscendC::CrossCoreWaitFlag<0x2>(syncgmmIdx / CROSS_CORE_FLAG_MAX_SET_COUNT);
-                    syncgmmIdx ++;
-                }
+            // One wait per batch of groups, matching the batched signal from
+            // the dispatch side.
+            if (groupIdx == syncGroupIdx) {
+                AscendC::CrossCoreWaitFlag<0x2>(syncgmmIdx / CROSS_CORE_FLAG_MAX_SET_COUNT);
+                syncgmmIdx++;
+                syncGroupIdx += GROUP_SYNC_SIZE;
+            }
 
+            for (uint32_t loopIdx = startLoopIdx; loopIdx < coreLoops; loopIdx += coreNum) {
                 // Compute block location
                 GemmCoord blockCoord = blockScheduler.GetBlockCoord(loopIdx);
                 GemmCoord actualBlockShape = blockScheduler.GetActualBlockShape(blockCoord);
@@ -524,9 +530,9 @@ private:
             startCoreIdx = (startCoreIdx  + coreLoops) % coreNum;
         }
 
-        for(;syncGroupIdx < params.expertPerRank; syncGroupIdx++) {
+        for(; syncGroupIdx < params.expertPerRank; syncGroupIdx += GROUP_SYNC_SIZE) {
             AscendC::CrossCoreWaitFlag<0x2>(syncgmmIdx / CROSS_CORE_FLAG_MAX_SET_COUNT);
-            syncgmmIdx ++;
+            syncgmmIdx++;
         }
 
         if constexpr (BlockMmad::DispatchPolicy::ASYNC) {
@@ -840,32 +846,81 @@ private:
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
         int32_t pingpongIdx = 0;
+        // Parallelize each destination rank's copy over all AIV cores. The old
+        // one-core-per-rank mapping left coreNum-EP cores idle (EP=2 => only 2
+        // of 48 AIV cores copying), which put the whole dispatch phase on 2
+        // cores and serialized the copy in front of the matmul.
+        // Only spread a rank's rows over multiple cores when each (rank, expert)
+        // carries enough rows for the extra per-core bookkeeping to pay off;
+        // otherwise the per-core scalar overhead dominates the tiny copy.
+        const bool useParallelDispatch =
+            params.EP <= coreNum &&
+            static_cast<int64_t>(params.problemShape.m()) * params.topK >=
+                static_cast<int64_t>(8) * params.EP * params.expertPerRank;
+        const int32_t coresPerRank = useParallelDispatch ? (coreNum / params.EP) : 1;
+        const int32_t myDstEpIdx = useParallelDispatch ? (coreIdx / coresPerRank) : -1;
+        const int32_t myCoreInRank = useParallelDispatch ? (coreIdx % coresPerRank) : 0;
+        // Source layout is one contiguous segment per destination rank, ordered
+        // by (expert group, token row). A core owns a row range of a fixed rank,
+        // so it tracks that rank segment's running source offset across groups.
+        uint32_t mySrcOffset = (myDstEpIdx >= 0 && myDstEpIdx < params.EP)
+            ? static_cast<uint32_t>(preSumBeforeRank(myDstEpIdx * params.expertPerRank))
+            : 0;
         for (int32_t groupIdx = 0; groupIdx < params.expertPerRank; ++groupIdx) {
-            // The ith core reads data from the ith rank's peermem
             uint32_t currentM = cumsumMM((params.EP - 1) * params.expertPerRank + groupIdx);
-            for(int32_t dstEpIdx = coreIdx; dstEpIdx < params.EP; dstEpIdx += coreNum) {
-                uint32_t rowStart = (dstEpIdx == 0 ? 0 : cumsumMM((dstEpIdx - 1) * params.expertPerRank + groupIdx)) + prevGroupSum1;
-                if (rowStart < params.maxOutputSize) {
-                    uint32_t rows = tokenPerExpert(tokenPerExpertLayout(dstEpIdx, params.rank, groupIdx));
-                    if (rowStart + rows > params.maxOutputSize) {
-                        rows = params.maxOutputSize - rowStart;
+            if (useParallelDispatch) {
+                if (myDstEpIdx < params.EP) {
+                    uint32_t rowStart = (myDstEpIdx == 0 ? 0 : cumsumMM((myDstEpIdx - 1) * params.expertPerRank + groupIdx)) + prevGroupSum1;
+                    if (rowStart < params.maxOutputSize) {
+                        uint32_t rows = tokenPerExpert(tokenPerExpertLayout(myDstEpIdx, params.rank, groupIdx));
+                        if (rowStart + rows > params.maxOutputSize) {
+                            rows = params.maxOutputSize - rowStart;
+                        }
+                        uint32_t rowSrc = mySrcOffset;
+                        mySrcOffset += rows;
+                        int32_t chunk = CeilDiv(static_cast<int32_t>(rows), coresPerRank);
+                        int32_t myStart = myCoreInRank * chunk;
+                        if (myStart < static_cast<int32_t>(rows)) {
+                            int32_t myRows = min(chunk, static_cast<int32_t>(rows) - myStart);
+                            GM_ADDR otherRankPtr = shmem(0, myDstEpIdx);
+                            AscendC::GlobalTensor<ElementA> gmRemoteA;
+                            gmRemoteA.SetGlobalBuffer(reinterpret_cast<__gm__ ElementA*>(otherRankPtr + peermemInfo.offsetA));
+                            MatrixCoord offsetA{static_cast<uint32_t>(rowStart + myStart), 0};
+                            int64_t gmOffsetA = params.layoutA.GetOffset(offsetA);
+                            int64_t gmOffsetPeer = static_cast<int64_t>(rowSrc + myStart) * (params.problemShape.k() + UB_ALIGN);
+                            int32_t ubMoveNum = 8;
+                            CopyGMToGMPerToken(gmA[gmOffsetA], gmPerTokenScale1[rowStart + myStart], gmRemoteA[gmOffsetPeer], myRows, params.problemShape.k(), ubMoveNum, pingpongIdx);
+                        }
                     }
-                    uint32_t rowSrc = prevSum;
-                    prevSum += rows;
-                    GM_ADDR otherRankPtr = shmem(0, dstEpIdx);
-                    AscendC::GlobalTensor<ElementA> gmRemoteA;
-                    gmRemoteA.SetGlobalBuffer(reinterpret_cast<__gm__ ElementA*>(otherRankPtr + peermemInfo.offsetA));
-                    MatrixCoord offsetA{rowStart, 0};
-                    int64_t gmOffsetA = params.layoutA.GetOffset(offsetA);
-                    int64_t gmOffsetPeer = rowSrc * (params.problemShape.k() + UB_ALIGN);
-                    int32_t ubMoveNum = 2;
-                    CopyGMToGMPerToken(gmA[gmOffsetA], gmPerTokenScale1[rowStart], gmRemoteA[gmOffsetPeer],  rows, params.problemShape.k(), ubMoveNum, pingpongIdx);
                 }
-
+            } else {
+                // Small batches or more ranks than AIV cores: keep the
+                // original one-core-per-rank walk.
+                for(int32_t dstEpIdx = coreIdx; dstEpIdx < params.EP; dstEpIdx += coreNum) {
+                    uint32_t rowStart = (dstEpIdx == 0 ? 0 : cumsumMM((dstEpIdx - 1) * params.expertPerRank + groupIdx)) + prevGroupSum1;
+                    if (rowStart < params.maxOutputSize) {
+                        uint32_t rows = tokenPerExpert(tokenPerExpertLayout(dstEpIdx, params.rank, groupIdx));
+                        if (rowStart + rows > params.maxOutputSize) {
+                            rows = params.maxOutputSize - rowStart;
+                        }
+                        uint32_t rowSrc = prevSum;
+                        prevSum += rows;
+                        GM_ADDR otherRankPtr = shmem(0, dstEpIdx);
+                        AscendC::GlobalTensor<ElementA> gmRemoteA;
+                        gmRemoteA.SetGlobalBuffer(reinterpret_cast<__gm__ ElementA*>(otherRankPtr + peermemInfo.offsetA));
+                        MatrixCoord offsetA{rowStart, 0};
+                        int64_t gmOffsetA = params.layoutA.GetOffset(offsetA);
+                        int64_t gmOffsetPeer = rowSrc * (params.problemShape.k() + UB_ALIGN);
+                        int32_t ubMoveNum = 2;
+                        CopyGMToGMPerToken(gmA[gmOffsetA], gmPerTokenScale1[rowStart], gmRemoteA[gmOffsetPeer],  rows, params.problemShape.k(), ubMoveNum, pingpongIdx);
+                    }
+                }
             }
-            AscendC::SyncAll<true>();
-            AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(syncgmm1Idx / CROSS_CORE_FLAG_MAX_SET_COUNT);
-            syncgmm1Idx ++;
+            if (((groupIdx + 1) % GROUP_SYNC_SIZE == 0) || (groupIdx + 1 == params.expertPerRank)) {
+                AscendC::SyncAll<true>();
+                AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(syncgmm1Idx / CROSS_CORE_FLAG_MAX_SET_COUNT);
+                syncgmm1Idx++;
+            }
 
             prevGroupSum1 += currentM;
 
